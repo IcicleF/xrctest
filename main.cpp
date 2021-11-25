@@ -10,6 +10,9 @@ using namespace std;
 #define MEMLEN (1024 * 1024 * 1024)
 #define InitPSN 3185
 
+#define TWO_SIDED_TEST true
+#define ONE_SIDED_TEST true
+
 /*
  * XRC receive QPs are shareable across multiple processes. Allow any process with access to the XRC
  * domain to open an existing QP. After opening the QP, the process will receive events related to
@@ -24,12 +27,18 @@ struct OOBExchange {
     uint32_t qp_num;
     uint32_t srq_num;
 
+    uint64_t addr;
+    uint32_t rkey;
+
     explicit OOBExchange()
     {
         memset(&gid, 0, sizeof(ibv_gid));
         lid = 0;
         qp_num = 0;
         srq_num = 0;
+
+        addr = 0;
+        rkey = 0;
     }
 };
 
@@ -49,8 +58,10 @@ int main(int argc, char **argv)
     const char *dev_name = "mlx5_0";
     int n_devices;
     ibv_device **dev_list = ibv_get_device_list(&n_devices);
-    if (!n_devices || !dev_list)
-        throw std::runtime_error("cannot find any RDMA device");
+    if (!n_devices || !dev_list) {
+        fprintf(stderr, "cannot find any RDMA device\n");
+        exit(-1);
+    }
 
     int target = -1;
     if (dev_name == nullptr)
@@ -62,8 +73,10 @@ int main(int argc, char **argv)
                 break;
             }
     }
-    if (target < 0)
-        throw std::runtime_error("cannot find device: " + std::string(dev_name));
+    if (target < 0) {
+        fprintf(stderr, "cannot find device %s\n", dev_name);
+        exit(-1);
+    }
 
     ibv_context *ctx = ibv_open_device(dev_list[target]);
     ibv_free_device_list(dev_list);
@@ -183,34 +196,74 @@ int main(int argc, char **argv)
         // Sync with receiver side
         MPI_Barrier(MPI_COMM_WORLD);
 
-        // Perform send
-        int nchars = sprintf(buf, "Hello RDMA XRC!");
+        // Test 1
+        // Perform send (two-sided)
+        if (TWO_SIDED_TEST) {
+            int nchars = sprintf(buf, "Hello RDMA XRC!");
 
-        ibv_exp_send_wr wr, *bad_wr;
-        ibv_sge sge;
-        sge.addr = reinterpret_cast<uintptr_t>(buf);
-        sge.length = nchars;
-        sge.lkey = mr->lkey;
+            ibv_exp_send_wr wr, *bad_wr;
+            ibv_sge sge;
+            sge.addr = reinterpret_cast<uintptr_t>(buf);
+            sge.length = nchars;
+            sge.lkey = mr->lkey;
 
-        memset(&wr, 0, sizeof(ibv_exp_send_wr));
-        wr.next = nullptr;
-        wr.wr_id = 0;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.exp_opcode = IBV_EXP_WR_SEND;
-        wr.exp_send_flags = IBV_EXP_SEND_SIGNALED;
-        wr.xrc_remote_srq_num = tgt_xchg.srq_num;  // Remote SRQ num
-        ibv_exp_post_send(qp, &wr, &bad_wr);
+            memset(&wr, 0, sizeof(ibv_exp_send_wr));
+            wr.next = nullptr;
+            wr.wr_id = 0;
+            wr.sg_list = &sge;
+            wr.num_sge = 1;
+            wr.exp_opcode = IBV_EXP_WR_SEND;
+            wr.exp_send_flags = IBV_EXP_SEND_SIGNALED;
+            wr.xrc_remote_srq_num = tgt_xchg.srq_num;  // Remote SRQ num
+            ibv_exp_post_send(qp, &wr, &bad_wr);
 
-        ibv_wc wc[2];
-        memset(wc, 0, sizeof(ibv_wc) * 2);
-        while (ibv_poll_cq(cq, 1, wc) == 0)
-            ;
-        if (wc[0].status != IBV_WC_SUCCESS)
-            fprintf(stderr, "[INI] send wc error %d\n", wc[0].status);
+            ibv_wc wc[2];
+            memset(wc, 0, sizeof(ibv_wc) * 2);
+            while (ibv_poll_cq(cq, 1, wc) == 0)
+                ;
+            if (wc[0].status != IBV_WC_SUCCESS)
+                fprintf(stderr, "[INI] send RDMA wc error %d\n", wc[0].status);
 
-        // Sync with receiver side (now he should printed what I sent to him!)
-        MPI_Barrier(MPI_COMM_WORLD);
+            // Sync with receiver side (now he should printed what I sent to him!)
+            memset(buf, 0, MEMLEN);
+            MPI_Barrier(MPI_COMM_WORLD);
+        }
+
+        // Test 2
+        // Perform RDMA write (one-sided)
+        if (ONE_SIDED_TEST) {
+            int nchars = sprintf(buf, "Hello RDMA XRC (single-sided)!");
+
+            ibv_exp_send_wr wr, *bad_wr;
+            ibv_sge sge;
+            sge.addr = reinterpret_cast<uintptr_t>(buf);
+            sge.length = nchars;
+            sge.lkey = mr->lkey;
+
+            memset(&wr, 0, sizeof(ibv_exp_send_wr));
+            wr.next = nullptr;
+            wr.wr_id = 0;
+            wr.sg_list = &sge;
+            wr.num_sge = 1;
+            wr.exp_opcode = IBV_EXP_WR_RDMA_WRITE;
+            wr.wr.rdma.remote_addr = tgt_xchg.addr;
+            wr.wr.rdma.rkey = tgt_xchg.rkey;
+            wr.exp_send_flags = IBV_EXP_SEND_SIGNALED;
+            wr.xrc_remote_srq_num = tgt_xchg.srq_num;  // Remote SRQ num (need one?)
+            ibv_exp_post_send(qp, &wr, &bad_wr);
+
+            ibv_wc wc[2];
+            memset(wc, 0, sizeof(ibv_wc) * 2);
+            while (ibv_poll_cq(cq, 1, wc) == 0)
+                ;
+            if (wc[0].status != IBV_WC_SUCCESS)
+                fprintf(stderr, "[INI] send wc error %d\n", wc[0].status);
+
+            // Sync with receiver side (he should print what I wrote to him between the two
+            // barriers!)
+            MPI_Barrier(MPI_COMM_WORLD);
+            MPI_Barrier(MPI_COMM_WORLD);
+        }
 
         // Initiator clean-up
         ibv_destroy_qp(qp);
@@ -286,6 +339,9 @@ int main(int argc, char **argv)
         xchg.qp_num = qp->qp_num;
         xchg.srq_num = srq_num;
 
+        xchg.addr = reinterpret_cast<uint64_t>(buf);
+        xchg.rkey = mr->rkey;
+
         MPI_Status mpirc;
         MPI_Recv(&ini_xchg, 1, XchgQPInfoTy, INI, 0, MPI_COMM_WORLD,
                  &mpirc);                                          // Recv from INI first
@@ -356,32 +412,46 @@ int main(int argc, char **argv)
         // Sync with requester side
         MPI_Barrier(MPI_COMM_WORLD);
 
-        // Perform recv
-        memset(buf, 0, MEMLEN);
+        // Test 1
+        // Perform recv (two-sided)
+        if (TWO_SIDED_TEST) {
+            memset(buf, 0, MEMLEN);
 
-        ibv_recv_wr wr, *bad_wr;
-        ibv_sge sge;
-        sge.addr = reinterpret_cast<uintptr_t>(buf);
-        sge.length = 128;
-        sge.lkey = mr->lkey;
+            ibv_recv_wr wr, *bad_wr;
+            ibv_sge sge;
+            sge.addr = reinterpret_cast<uintptr_t>(buf);
+            sge.length = 128;
+            sge.lkey = mr->lkey;
 
-        memset(&wr, 0, sizeof(wr));
-        wr.next = nullptr;
-        wr.wr_id = 0;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        ibv_post_srq_recv(srq, &wr, &bad_wr);
+            memset(&wr, 0, sizeof(wr));
+            wr.next = nullptr;
+            wr.wr_id = 0;
+            wr.sg_list = &sge;
+            wr.num_sge = 1;
+            ibv_post_srq_recv(srq, &wr, &bad_wr);
 
-        ibv_wc wc[2];
-        memset(wc, 0, sizeof(ibv_wc) * 2);
-        while (ibv_poll_cq(cq, 1, wc) == 0)
-            ;
-        if (wc[0].status != IBV_WC_SUCCESS)
-            fprintf(stderr, "[TGT] recv wc error %d\n", wc[0].status);
+            ibv_wc wc[2];
+            memset(wc, 0, sizeof(ibv_wc) * 2);
+            while (ibv_poll_cq(cq, 1, wc) == 0)
+                ;
+            if (wc[0].status != IBV_WC_SUCCESS)
+                fprintf(stderr, "[TGT] recv wc error %d\n", wc[0].status);
 
-        // Print what I received and sync
-        fprintf(stderr, "[TGT] received = %s\n", buf);
-        MPI_Barrier(MPI_COMM_WORLD);
+            // Print what I received and sync
+            fprintf(stderr, "[TGT] received = %s\n", buf);
+            memset(buf, 0, MEMLEN);
+            MPI_Barrier(MPI_COMM_WORLD);
+        }
+
+        // Test 2
+        if (ONE_SIDED_TEST) {
+            // Wait for RDMA write (one-sided)
+            MPI_Barrier(MPI_COMM_WORLD);
+
+            // Print what I am written and sync
+            fprintf(stderr, "[TGT] written = %s\n", buf);
+            MPI_Barrier(MPI_COMM_WORLD);
+        }
 
         // Target clean-up
         ibv_destroy_qp(qp);
